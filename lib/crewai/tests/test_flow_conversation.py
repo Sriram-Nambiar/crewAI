@@ -2510,3 +2510,224 @@ class TestClassConfigStillWins:
 
         assert flow._conversation_config.llm is llm
         assert flow._conversation_config.system_prompt == "From the class."
+
+
+class TestMinimalDeclarativeChat:
+    """A declaration only has to name its own routes."""
+
+    @staticmethod
+    def _declaration(**overrides: Any) -> dict[str, Any]:
+        declaration: dict[str, Any] = {
+            "schema": "crewai.flow/v1",
+            "name": "MinimalChat",
+            "conversational": {},
+            "methods": {
+                "handle_order": {
+                    "do": {"call": "expression", "expr": "'Your order shipped.'"},
+                    "listen": "order",
+                    "description": "Order status questions.",
+                }
+            },
+        }
+        declaration.update(overrides)
+        return declaration
+
+    def test_minimal_declaration_runs_a_conversational_turn(self) -> None:
+        # No custom routes, so the router does not auto-enable and the turn
+        # goes straight to the built-in converse handler.
+        declaration = self._declaration(methods={})
+        flow = Flow.from_declaration(contents=declaration)
+        flow._conversation_config.llm = _ScriptedLLM(["Hello there."])
+
+        assert flow.handle_turn("hi") == "Hello there."
+        assert [(m.role, m.content) for m in flow.state.messages] == [
+            ("user", "hi"),
+            ("assistant", "Hello there."),
+        ]
+
+    def test_minimal_declaration_implies_conversation_state(self) -> None:
+        flow = Flow.from_declaration(contents=self._declaration())
+
+        assert isinstance(flow.state, ConversationState)
+
+    def test_minimal_declaration_routes_to_a_declared_handler(self) -> None:
+        flow = Flow.from_declaration(contents=self._declaration())
+        flow._conversation_config.router = RouterConfig(
+            llm=_ScriptedLLM(['{"intent": "order"}'])
+        )
+
+        assert flow.handle_turn("where is my order?") == "Your order shipped."
+        assert flow.state.last_intent == "order"
+
+    def test_method_description_reaches_the_router_catalog(self) -> None:
+        flow = Flow.from_declaration(contents=self._declaration())
+
+        catalog = flow._build_route_catalog(RouterConfig(routes=["order"]))
+
+        assert catalog["order"] == "Order status questions."
+
+
+class TestBuiltinGraphSynthesis:
+    """A declaration does not have to name the built-in graph."""
+
+    GRAPH = {
+        "route_conversation",
+        "converse_turn",
+        "end_conversation",
+        "answer_from_history_turn",
+    }
+
+    @staticmethod
+    def _declaration(**overrides: Any) -> dict[str, Any]:
+        declaration: dict[str, Any] = {
+            "schema": "crewai.flow/v1",
+            "name": "SynthChat",
+            "conversational": {},
+            "methods": {
+                "handle_order": {
+                    "do": {"call": "expression", "expr": "'shipped'"},
+                    "listen": "order",
+                }
+            },
+        }
+        declaration.update(overrides)
+        return declaration
+
+    def test_graph_is_synthesized_with_its_roles(self) -> None:
+        flow = Flow.from_declaration(contents=self._declaration())
+        methods = flow._definition.methods
+
+        assert self.GRAPH <= set(methods)
+        assert methods["route_conversation"].start is True
+        assert methods["route_conversation"].router is True
+        assert methods["converse_turn"].listen == "converse"
+        assert methods["end_conversation"].listen == "end"
+        assert methods["answer_from_history_turn"].listen == "answer_from_history"
+
+    def test_synthesized_refs_match_the_python_projection(self) -> None:
+        class ProjectedChat(Flow):
+            conversational = True
+
+        projected = ProjectedChat.flow_definition().methods
+        synthesized = Flow.from_declaration(
+            contents=self._declaration()
+        )._definition.methods
+
+        for name in self.GRAPH:
+            assert synthesized[name].do == projected[name].do
+
+    def test_author_supplied_entry_is_not_overridden(self) -> None:
+        declaration = self._declaration()
+        declaration["methods"]["converse_turn"] = {
+            "do": {"call": "expression", "expr": "'mine'"},
+            "listen": "converse",
+        }
+
+        flow = Flow.from_declaration(contents=declaration)
+
+        assert flow._definition.methods["converse_turn"].do.expr == "'mine'"
+
+    def test_disabled_block_synthesizes_nothing(self) -> None:
+        flow = Flow.from_declaration(
+            contents=self._declaration(conversational={"enabled": False})
+        )
+
+        assert set(flow._definition.methods) == {"handle_order"}
+
+    def test_non_conversational_flow_synthesizes_nothing(self) -> None:
+        flow = Flow.from_declaration(
+            contents={
+                "schema": "crewai.flow/v1",
+                "name": "Plain",
+                "methods": {
+                    "begin": {
+                        "do": {"call": "expression", "expr": "'x'"},
+                        "start": True,
+                    }
+                },
+            }
+        )
+
+        assert set(flow._definition.methods) == {"begin"}
+
+    def test_the_loaded_definition_itself_is_left_alone(self) -> None:
+        """Synthesis is a runtime concern; the contract stays as authored."""
+        from crewai.flow.flow_definition import FlowDefinition
+
+        definition = FlowDefinition.from_declaration(contents=self._declaration())
+
+        assert set(definition.methods) == {"handle_order"}
+
+
+class TestRouteDescriptions:
+    """Route descriptions survive into a declaration."""
+
+    def test_python_handler_docstring_is_projected(self) -> None:
+        class DocumentedChat(Flow):
+            conversational = True
+
+            @listen("research")
+            def handle_research(self) -> str:
+                """Fresh web research and current news."""
+                return "researched"
+
+        definition = DocumentedChat.flow_definition()
+
+        assert (
+            definition.methods["handle_research"].description
+            == "Fresh web research and current news."
+        )
+
+    def test_declared_description_reaches_the_catalog(self) -> None:
+        flow = Flow.from_declaration(
+            contents={
+                "schema": "crewai.flow/v1",
+                "name": "DescribedChat",
+                "conversational": {},
+                "methods": {
+                    "handle_order": {
+                        "do": {"call": "expression", "expr": "'shipped'"},
+                        "listen": "order",
+                        "description": "Order status questions.",
+                    }
+                },
+            }
+        )
+
+        catalog = flow._build_route_catalog(RouterConfig(routes=["order"]))
+
+        assert catalog["order"] == "Order status questions."
+
+    def test_missing_description_is_empty_not_nonetype_docstring(self) -> None:
+        flow = Flow.from_declaration(
+            contents={
+                "schema": "crewai.flow/v1",
+                "name": "UndescribedChat",
+                "conversational": {},
+                "methods": {
+                    "handle_order": {
+                        "do": {"call": "expression", "expr": "'shipped'"},
+                        "listen": "order",
+                    }
+                },
+            }
+        )
+
+        catalog = flow._build_route_catalog(RouterConfig(routes=["order"]))
+
+        assert catalog["order"] == ""
+
+    def test_python_docstring_still_describes_the_route(self) -> None:
+        class DocumentedChat(Flow):
+            conversational = True
+
+            @listen("research")
+            def handle_research(self) -> str:
+                """Fresh web research and current news."""
+                return "researched"
+
+        catalog = DocumentedChat()._build_route_catalog(
+            RouterConfig(routes=["research"])
+        )
+
+        assert catalog["research"] == "Fresh web research and current news."

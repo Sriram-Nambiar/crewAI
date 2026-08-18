@@ -1024,17 +1024,23 @@ class _ConversationalMixin:
 
         True when either:
           - ``flow.defer_trace_finalization`` is set on the instance, OR
-          - the static conversational definition enables deferred finalization.
+          - the resolved conversational configuration enables it.
 
         Either source enables the deferred-session pattern. The caller
         eventually invokes ``finalize_session_traces()`` to close the batch.
+
+        Read through ``_conversation_config`` rather than the definition so
+        deferral follows the same precedence as every other behavior knob. A
+        class config and a declaration can disagree on the hybrid
+        ``ClassWithConfig.from_declaration(...)`` path, and deferral must not
+        be the one setting that follows the other source.
         """
         if getattr(self, "defer_trace_finalization", False):
             return True
-        definition = self._conversation_definition
-        return bool(
-            definition and definition.enabled and definition.defer_trace_finalization
-        )
+        if not self._is_conversational_enabled():
+            return False
+        config = self._conversation_config
+        return bool(config and config.defer_trace_finalization)
 
     def _reset_turn_execution_state(self) -> None:
         """Clear per-execution tracking so the next turn re-runs the graph."""

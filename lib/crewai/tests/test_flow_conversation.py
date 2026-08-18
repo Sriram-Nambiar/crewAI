@@ -2283,7 +2283,7 @@ class _ScriptedLLM(BaseLLM):
         object.__setattr__(self, "_responses", list(responses or []))
         object.__setattr__(self, "seen", [])
 
-    def call(self, messages, **kwargs) -> str:  # type: ignore[no-untyped-def]
+    def call(self, messages: Any, *args: Any, **kwargs: Any) -> str:
         self.seen.append(messages)
         return self._responses.pop(0) if self._responses else "fallback"
 
@@ -2494,6 +2494,44 @@ class TestClassConfigStillWins:
             pass
 
         assert LiveFormatFlow()._conversation_config.router.response_format is MyRoute
+
+    def test_defer_trace_finalization_follows_the_class_config(self) -> None:
+        """Deferral is a behavior knob, so it follows the same precedence.
+
+        The class config and the declaration can disagree on the hybrid path;
+        every other setting follows the class config, and this must too.
+        """
+
+        @ConversationConfig(defer_trace_finalization=False)
+        class ConfiguredChat(Flow):
+            conversational = True
+
+        flow = ConfiguredChat.from_declaration(
+            contents=_conversational_declaration(conversational={})
+        )
+
+        assert flow._conversation_definition.defer_trace_finalization is True
+        assert flow._conversation_config.defer_trace_finalization is False
+        assert flow._should_defer_trace_finalization() is False
+
+    def test_instance_flag_still_forces_deferral(self) -> None:
+        @ConversationConfig(defer_trace_finalization=False)
+        class ConfiguredChat(Flow):
+            conversational = True
+
+        flow = ConfiguredChat()
+        assert flow._should_defer_trace_finalization() is False
+
+        flow.defer_trace_finalization = True
+        assert flow._should_defer_trace_finalization() is True
+
+    def test_non_conversational_flow_never_defers_from_config(self) -> None:
+        class PlainFlow(Flow):
+            @start()
+            def begin(self) -> str:
+                return "begin"
+
+        assert PlainFlow()._should_defer_trace_finalization() is False
 
     def test_class_config_wins_over_a_declaration_block(self) -> None:
         llm = _ScriptedLLM(["from the class config"])
@@ -2739,7 +2777,7 @@ class TestHandlerReplyPromotion:
     class _AgentOutput:
         """Shape of ``LiteAgentOutput`` / ``CrewOutput``: text lives on ``.raw``."""
 
-        def __init__(self, raw: str) -> None:
+        def __init__(self, raw: Any) -> None:
             self.raw = raw
 
         def __str__(self) -> str:
@@ -2797,7 +2835,7 @@ class TestHandlerReplyPromotion:
         assert [m.role for m in flow.state.messages] == ["user"]
 
     def test_non_text_output_is_not_promoted(self) -> None:
-        flow = self._chat(self._AgentOutput(raw=None))  # type: ignore[arg-type]
+        flow = self._chat(self._AgentOutput(raw=None))
 
         flow.handle_turn("hi")
 
@@ -2818,3 +2856,88 @@ class TestHandlerReplyPromotion:
             ("user", "hi"),
             ("assistant", "explicit"),
         ]
+
+
+class TestDeclarativeTurnMatrix:
+    """A declaration-built flow across the turn entry points."""
+
+    @staticmethod
+    def _flow(reply: str = "Declared reply.") -> Flow[Any]:
+        flow = Flow.from_declaration(
+            contents={
+                "schema": "crewai.flow/v1",
+                "name": "MatrixChat",
+                "conversational": {},
+                "methods": {},
+            }
+        )
+        flow._conversation_config.llm = _ScriptedLLM([reply])
+        return flow
+
+    def test_sync_turn(self) -> None:
+        assert self._flow().handle_turn("hi") == "Declared reply."
+
+    def test_stream_turn_frames_match_the_class_based_path(self) -> None:
+        """A chat UI must see the same frame sequence either way."""
+
+        @ConversationConfig(llm=_ScriptedLLM(["streamed reply"]))
+        class ClassChat(Flow[ConversationState]):
+            pass
+
+        class_frames = [f.type for f in ClassChat().stream_turn("hi").events]
+
+        flow = self._flow("streamed reply")
+        stream = flow.stream_turn("hi", session_id="session-1")
+        declared_frames = [f.type for f in stream.events]
+
+        assert declared_frames == class_frames
+        assert declared_frames[0] == "conversation_turn_started"
+        assert declared_frames[-1] == "conversation_turn_completed"
+        assert "conversation_message_added" in declared_frames
+        assert stream.result == "streamed reply"
+        assert flow.state.messages[-1].content == "streamed reply"
+
+    def test_turn_inside_a_running_event_loop(self) -> None:
+        """``kickoff`` takes its thread-pool path when a loop is already running."""
+        import asyncio
+
+        flow = self._flow("reply from the loop")
+
+        async def run() -> Any:
+            return flow.handle_turn("hi")
+
+        assert asyncio.run(run()) == "reply from the loop"
+        assert flow.state.messages[-1].content == "reply from the loop"
+
+    def test_follow_up_turn_keeps_history(self) -> None:
+        flow = self._flow()
+        flow._conversation_config.llm = _ScriptedLLM(["first", "second"])
+
+        flow.handle_turn("one")
+        flow.handle_turn("two")
+
+        assert [(m.role, m.content) for m in flow.state.messages] == [
+            ("user", "one"),
+            ("assistant", "first"),
+            ("user", "two"),
+            ("assistant", "second"),
+        ]
+
+    def test_chat_repl_drives_declared_turns(self) -> None:
+        flow = self._flow()
+        flow._conversation_config.llm = _ScriptedLLM(["hello", "goodbye"])
+        prompts: list[str] = []
+        outputs: list[str] = []
+
+        flow.chat(
+            input_fn=lambda prompt: (prompts.append(prompt), ["hi", "bye", "exit"][
+                len(prompts) - 1
+            ])[1],
+            output_fn=outputs.append,
+        )
+
+        assert [m.content for m in flow.state.messages if m.role == "user"] == [
+            "hi",
+            "bye",
+        ]
+        assert len(outputs) == 2

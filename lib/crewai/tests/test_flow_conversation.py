@@ -2275,6 +2275,12 @@ class TestHandleTurnGuard:
 _MIXIN = "crewai.experimental.conversational_mixin:_ConversationalMixin"
 
 
+class DeclaredChatState(ConversationState):
+    """Module-level so ``state.ref`` can import it; a locals-scoped class cannot."""
+
+    ticket_id: str | None = None
+
+
 class _ScriptedLLM(BaseLLM):
     """Fake LLM returning queued responses; records the messages it saw."""
 
@@ -2418,31 +2424,18 @@ class TestConversationalStatePrecedence:
     """A declared ``state:`` block is never replaced by the default."""
 
     def test_declared_state_survives_on_both_paths(self) -> None:
-        class DeclaredChatState(ConversationState):
-            ticket_id: str | None = None
-
         class SubclassChat(Flow):
             conversational = True
 
         declaration = _conversational_declaration(
-            state={
-                "type": "pydantic",
-                "ref": f"{__name__}:TestConversationalStatePrecedence."
-                "test_declared_state_survives_on_both_paths."
-                "<locals>.DeclaredChatState",
-            }
+            state={"type": "pydantic", "ref": f"{__name__}:DeclaredChatState"}
         )
-        # A locals-scoped ref is not importable; point at the module attribute.
-        globals()["DeclaredChatState"] = DeclaredChatState
-        declaration["state"]["ref"] = f"{__name__}:DeclaredChatState"
 
         for cls in (Flow, SubclassChat):
-            flow = cls.from_declaration(contents=declaration)
+            state = cls.from_declaration(contents=declaration).state
 
-            assert hasattr(flow.state, "ticket_id"), cls.__name__
-            assert hasattr(flow.state, "messages"), cls.__name__
-
-        del globals()["DeclaredChatState"]
+            assert "ticket_id" in type(state).model_fields, cls.__name__
+            assert "messages" in type(state).model_fields, cls.__name__
 
     def test_conversation_state_is_implied_when_none_declared(self) -> None:
         declaration = _conversational_declaration()
